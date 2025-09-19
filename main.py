@@ -18,6 +18,37 @@ import yaml
 from reporter import Finding, Reporter, dedupe_findings
 LOG = logging.getLogger("secrets_watch")
 
+FALSE_POSITIVE_GO_SUM = "go.sum"
+FALSE_POSITIVE_PLACEHOLDERS = {
+    "jdbc:postgresql://127.0.0.1:",
+    "http://user:password@proxy.example.org:1234",
+}
+
+def _is_go_sum_placeholder(finding: Finding) -> bool:
+    if not finding.file_path:
+        return False
+    if not finding.file_path.lower().endswith(FALSE_POSITIVE_GO_SUM):
+        return False
+    raw = finding.raw_secret or ""
+    return raw.startswith("h1:")
+
+def _is_placeholder_secret(finding: Finding) -> bool:
+    raw = finding.raw_secret or ""
+    return raw in FALSE_POSITIVE_PLACEHOLDERS
+
+def filter_false_positives(candidates: list[Finding]) -> list[Finding]:
+    filtered: list[Finding] = []
+    for finding in candidates:
+        if _is_go_sum_placeholder(finding):
+            LOG.debug("Filtered go.sum checksum in %s (%s)", finding.repository.slug, finding.file_path)
+            continue
+        if _is_placeholder_secret(finding):
+            LOG.debug("Filtered placeholder secret in %s (%s)", finding.repository.slug, finding.file_path)
+            continue
+        filtered.append(finding)
+    return filtered
+
+
 
 
 @dataclass
@@ -27,6 +58,7 @@ class RunContext:
     gitleaks_cfg: dict[str, Any]
     dorks_cfg: dict[str, Any]
     run_cfg: dict[str, Any]
+    notifications_cfg: dict[str, Any]
     token: str | None
     log_path: Path
     history_path: Path
@@ -409,7 +441,7 @@ def run_gitleaks(org: str, repos: list[dict[str, Any]], cfg: RunContext) -> list
         LOG.info("[%s] Gitleaks scanning %s/%s (branch %s)", idx, org, repo_name, default_branch)
         command: list[str] = [
             path,
-            "git",
+            "detect",
             "--repo-url",
             str(repo_url),
             "--branch",
@@ -558,7 +590,50 @@ def prefilter_by_dorks(
     return flagged
 
 
-def process_org(org_cfg: dict[str, Any], context: RunContext) -> tuple[list[Finding], int]:
+def send_discord_findings(
+    webhook: str,
+    org: str,
+    scanner: str,
+    findings: list[Finding],
+) -> None:
+    if not webhook or not findings:
+        return
+    snippet = findings[:5]
+    generated_at = datetime.now(timezone.utc)
+    lines = []
+    for finding in snippet:
+        repo = finding.repository.slug
+        location = finding.location
+        commit = finding.commit[:8] if finding.commit else ""
+        lines.append(f"- {finding.secret_type} | {repo} | {location} | {commit}")
+    value = "\n".join(lines)
+    if len(findings) > len(snippet):
+        value += f"\n... and {len(findings) - len(snippet)} more"
+    embed = {
+        "title": f"Secrets Watcher: {scanner} findings in {org}",
+        "color": 0xF1C40F,
+        "timestamp": generated_at.isoformat(),
+        "fields": [
+            {"name": "Findings", "value": value or "(summary unavailable)", "inline": False}
+        ],
+    }
+    payload = {"embeds": [embed]}
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        webhook, data=data, headers={"Content-Type": "application/json"}
+    )
+    try:
+        urllib.request.urlopen(request, timeout=10)
+    except Exception:
+        pass
+
+
+def process_org(
+    org_cfg: dict[str, Any],
+    context: RunContext,
+    webhook_url: str | None,
+    notify_immediate: bool,
+) -> tuple[list[Finding], int]:
     org_name = str(org_cfg.get("name"))
     if not org_name:
         raise RuntimeError("Org configuration missing name")
@@ -598,14 +673,20 @@ def process_org(org_cfg: dict[str, Any], context: RunContext) -> tuple[list[Find
         LOG.info("Trufflehog produced %d finding(s) for %s", len(trufflehog_findings), org_name)
     else:
         LOG.debug("Trufflehog produced no findings for %s", org_name)
-    findings.extend(trufflehog_findings)
+    filtered_trufflehog = filter_false_positives(trufflehog_findings)
+    findings.extend(filtered_trufflehog)
+    if notify_immediate and webhook_url and filtered_trufflehog:
+        send_discord_findings(webhook_url, org_name, "Trufflehog", filtered_trufflehog)
 
     gitleaks_findings = run_gitleaks(org_name, repos, context)
     if gitleaks_findings:
         LOG.info("Gitleaks produced %d finding(s) for %s", len(gitleaks_findings), org_name)
     else:
         LOG.debug("Gitleaks produced no findings for %s", org_name)
-    findings.extend(gitleaks_findings)
+    filtered_gitleaks = filter_false_positives(gitleaks_findings)
+    findings.extend(filtered_gitleaks)
+    if notify_immediate and webhook_url and filtered_gitleaks:
+        send_discord_findings(webhook_url, org_name, "Gitleaks", filtered_gitleaks)
 
     return findings, len(repos)
 
@@ -620,6 +701,7 @@ def build_context(config: dict[str, Any], base_dir: Path) -> RunContext:
     trufflehog_cfg = scanners_cfg.get("trufflehog") or {}
     gitleaks_cfg = scanners_cfg.get("gitleaks") or {}
     dorks_cfg = config.get("dorks") or {}
+    notifications_cfg = config.get("notifications") or {}
     token = github_cfg.get("token") or None
     log_path = resolve_path(base_dir, run_cfg.get("raw_log_path", "logs/raw.log"))
     history_path = resolve_path(base_dir, run_cfg.get("history_path", "history.txt"))
@@ -632,6 +714,7 @@ def build_context(config: dict[str, Any], base_dir: Path) -> RunContext:
         gitleaks_cfg=gitleaks_cfg,
         dorks_cfg=dorks_cfg,
         run_cfg=run_cfg,
+        notifications_cfg=notifications_cfg,
         token=token,
         log_path=log_path,
         history_path=history_path,
@@ -656,6 +739,9 @@ def main() -> int:
     context = build_context(config, base_dir)
     reporter = Reporter(context.report_path)
     state_tracker = StateTracker(context.state_path)
+    notifications_cfg = context.notifications_cfg or {}
+    webhook_url = notifications_cfg.get("discord_webhook", "")
+    notify_immediate = bool(notifications_cfg.get("immediate", False))
 
     total_orgs = len(orgs)
     pointer = 0
@@ -679,7 +765,7 @@ def main() -> int:
         org_cfg = orgs[org_index]
         now = datetime.now(timezone.utc)
         try:
-            findings, repo_count = process_org(org_cfg, context)
+            findings, repo_count = process_org(org_cfg, context, webhook_url, notify_immediate)
             status = f"OK ({len(findings)} findings, {repo_count} repos)"
             all_findings.extend(findings)
         except Exception as exc:
@@ -700,7 +786,6 @@ def main() -> int:
     run_id = run_finished.strftime("%Y%m%dT%H%M%SZ")
     reporter.write_raw_jsonl(deduped, run_id, context.raw_dir)
     reporter.write_markdown(deduped, run_finished)
-    webhook_url = config.get("notifications", {}).get("discord_webhook", "")
     if webhook_url:
         send_discord_notification(
             webhook_url,

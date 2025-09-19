@@ -22,6 +22,7 @@ Key settings:
 - `scanners.trufflehog` / `scanners.gitleaks` – binary paths and flags
 - `dorks.queries` - optional GitHub code-search keywords used as a prefilter before cloning repos.
 - `run.log_level` - set to `INFO` (default) or `DEBUG` to control console verbosity.
+- `notifications.immediate` - set to `true` to send Discord alerts as soon as a scanner produces findings
 - `run` – where to save reports, logs, and state
 
 ## Run
