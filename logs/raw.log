@@ -1,0 +1,7 @@
+================================================================================
+2025-09-19T11:01:34.340905+00:00 | exit=1
+trufflehog github --org=google --results=verified,unknown --json --issue-comments --pr-comments --repo-comments --no-update
+--- stdout ---
+
+--- stderr ---
+trufflehog: error: unknown long flag '--repo-comments', try --help

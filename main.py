@@ -65,6 +65,7 @@ class RunContext:
     state_path: Path
     report_path: Path
     raw_dir: Path
+    notification_backup_dir: Path | None
 
 
 class StateTracker:
@@ -477,78 +478,6 @@ def run_gitleaks(org: str, repos: list[dict[str, Any]], cfg: RunContext) -> list
 
 
 
-def send_discord_notification(
-    webhook: str,
-    generated_at: datetime,
-    findings_count: int,
-    processed: int,
-    total_orgs: int,
-    statuses: list[str],
-    errors: list[str],
-    report_path: Path,
-    next_pointer: int,
-) -> None:
-    if not webhook:
-        return
-    try:
-        report_text = report_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        report_text = ""
-
-    if errors:
-        color = 0xE74C3C
-        title = "Secrets scan completed with errors"
-    elif findings_count:
-        color = 0xF1C40F
-        title = "Secrets scan found secrets"
-    else:
-        color = 0x2ECC71
-        title = "Secrets scan completed"
-
-    summary_lines = [
-        f"Processed orgs: {processed}/{total_orgs}",
-        f"Findings: {findings_count}",
-        f"Errors: {len(errors)}",
-        f"Next pointer: {next_pointer}",
-    ]
-
-    status_snippet = "\n".join(statuses[:10]) if statuses else "None"
-    if len(status_snippet) > 1000:
-        status_snippet = status_snippet[:1000] + "\n..."
-
-    error_snippet = "\n".join(errors[:5]) if errors else "None"
-    if len(error_snippet) > 1000:
-        error_snippet = error_snippet[:1000] + "\n..."
-
-    report_snippet = report_text.strip()
-    if len(report_snippet) > 1000:
-        report_snippet = report_snippet[:1000] + "\n..."
-    if report_snippet:
-        report_snippet = f"```markdown\n{report_snippet}\n```"
-
-    embed = {
-        "title": title,
-        "color": color,
-        "timestamp": generated_at.isoformat(),
-        "fields": [
-            {"name": "Summary", "value": "\n".join(summary_lines), "inline": False},
-            {"name": "Recent statuses", "value": status_snippet, "inline": False},
-        ],
-    }
-
-    if errors:
-        embed["fields"].append({"name": "Errors", "value": error_snippet, "inline": False})
-    if report_snippet:
-        embed["fields"].append({"name": "Report", "value": report_snippet, "inline": False})
-
-    payload = {"embeds": [embed]}
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request = urllib.request.Request(webhook, data=data, headers={"Content-Type": "application/json"})
-    try:
-        urllib.request.urlopen(request, timeout=10)
-    except Exception:
-        # Notification failures should not break the run
-        pass
 
 def prefilter_by_dorks(
     github_cfg: dict[str, Any],
@@ -590,31 +519,198 @@ def prefilter_by_dorks(
     return flagged
 
 
+_SENSITIVE_REPORT_PREFIXES = (
+    "- detail:",
+    "detail:",
+    "- description:",
+    "description:",
+    "- match:",
+    "match:",
+    "- verification:",
+    "verification:",
+    "- raw:",
+    "raw:",
+)
+
+
+def _clean_ascii(text: str) -> str:
+    cleaned = text.replace("`", "'").strip()
+    try:
+        return cleaned.encode("ascii", "ignore").decode("ascii")
+    except Exception:
+        return cleaned
+
+
+def _sanitize_report_lines(report_text: str, max_lines: int = 20) -> list[str]:
+    sanitized: list[str] = []
+    for raw_line in report_text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if any(lowered.startswith(prefix) for prefix in _SENSITIVE_REPORT_PREFIXES):
+            key = stripped.split(":", 1)[0]
+            sanitized_line = f"{key}: [redacted]"
+        else:
+            sanitized_line = stripped
+        sanitized_line = _clean_ascii(sanitized_line)
+        if not sanitized_line:
+            continue
+        if len(sanitized_line) > 200:
+            sanitized_line = sanitized_line[:197] + "..."
+        sanitized.append(sanitized_line)
+        if len(sanitized) >= max_lines:
+            break
+    return sanitized
+
+
+def send_discord_notification(
+    webhook: str,
+    generated_at: datetime,
+    findings_count: int,
+    processed: int,
+    total_orgs: int,
+    statuses: list[str],
+    errors: list[str],
+    report_path: Path,
+    backup_dir: Path | None,
+    next_pointer: int,
+) -> None:
+    if not webhook:
+        return
+    try:
+        report_text = report_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        report_text = ""
+
+    if errors:
+        color = 0xE74C3C
+        title = "Secrets scan completed with errors"
+    elif findings_count:
+        color = 0xF1C40F
+        title = "Secrets scan found secrets"
+    else:
+        color = 0x2ECC71
+        title = "Secrets scan completed"
+
+    summary_lines = [
+        _clean_ascii(f"Processed orgs: {processed}/{total_orgs}"),
+        _clean_ascii(f"Findings: {findings_count}"),
+        _clean_ascii(f"Errors: {len(errors)}"),
+        _clean_ascii(f"Next pointer: {next_pointer}"),
+    ]
+
+    status_lines = [_clean_ascii(line) for line in statuses[:10] if line]
+    status_snippet = "\n".join(status_lines) if status_lines else "None"
+    if len(status_snippet) > 1000:
+        status_snippet = status_snippet[:1000] + "\n..."
+
+    error_lines = [_clean_ascii(line) for line in errors[:5] if line]
+    error_snippet = "\n".join(error_lines) if error_lines else "None"
+    if len(error_snippet) > 1000:
+        error_snippet = error_snippet[:1000] + "\n..."
+
+    sanitized_lines = _sanitize_report_lines(report_text)
+    report_snippet = ""
+    if sanitized_lines:
+        snippet_body = "\n".join(sanitized_lines)
+        if len(snippet_body) > 1000:
+            snippet_body = snippet_body[:1000].rstrip() + "\n..."
+        report_snippet = f"```markdown\n{snippet_body}\n```"
+
+    embed = {
+        "title": title,
+        "color": color,
+        "timestamp": generated_at.isoformat(),
+        "fields": [
+            {"name": "Summary", "value": "\n".join(summary_lines), "inline": False},
+            {"name": "Recent statuses", "value": status_snippet, "inline": False},
+        ],
+    }
+
+    if error_lines:
+        embed["fields"].append({"name": "Errors", "value": error_snippet, "inline": False})
+    if report_snippet:
+        embed["fields"].append({"name": "Report", "value": report_snippet, "inline": False})
+
+    payload = {"embeds": [embed]}
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        webhook, data=data, headers={"Content-Type": "application/json"}
+    )
+
+    if backup_dir:
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_file = (
+                backup_dir
+                / f"{generated_at.strftime('%Y%m%dT%H%M%SZ')}_run-summary.txt"
+            )
+            backup_content: list[str] = [
+                f"Title: {title}",
+                f"Generated: {generated_at.isoformat()}",
+                "",
+                "Summary:",
+                *summary_lines,
+                "",
+                "Recent statuses:",
+                *(status_lines if status_lines else ["None"]),
+                "",
+                "Errors:",
+                *(error_lines if error_lines else ["None"]),
+            ]
+            if sanitized_lines:
+                backup_content.extend(["", "Report snippet:", *sanitized_lines])
+            backup_file.write_text("\n".join(backup_content) + "\n", encoding="utf-8")
+        except Exception as exc:
+            LOG.debug("Failed to write Discord summary backup: %s", exc)
+
+    try:
+        urllib.request.urlopen(request, timeout=10)
+    except Exception:
+        # Notification failures should not break the run
+        pass
+
+
 def send_discord_findings(
     webhook: str,
     org: str,
     scanner: str,
     findings: list[Finding],
+    backup_dir: Path | None,
 ) -> None:
     if not webhook or not findings:
         return
     snippet = findings[:5]
     generated_at = datetime.now(timezone.utc)
-    lines = []
+    safe_org = _clean_ascii(org)
+    safe_scanner = _clean_ascii(scanner)
+    lines: list[str] = []
     for finding in snippet:
-        repo = finding.repository.slug
-        location = finding.location
-        commit = finding.commit[:8] if finding.commit else ""
-        lines.append(f"- {finding.secret_type} | {repo} | {location} | {commit}")
-    value = "\n".join(lines)
-    if len(findings) > len(snippet):
-        value += f"\n... and {len(findings) - len(snippet)} more"
+        parts = [
+            _clean_ascii(finding.rule),
+            _clean_ascii(finding.repo),
+            _clean_ascii(finding.location),
+        ]
+        commit_fragment = _clean_ascii(finding.commit[:8]) if finding.commit else ""
+        if commit_fragment:
+            parts.append(commit_fragment)
+        summary = " | ".join(part for part in parts if part)
+        if not summary:
+            summary = "(details unavailable)"
+        lines.append(f"- {summary}")
+    more_count = len(findings) - len(snippet)
+    if more_count > 0:
+        lines.append(f"... and {more_count} more")
+    value = "\n".join(lines) if lines else "(summary unavailable)"
+    if len(value) > 1000:
+        value = value[:1000].rstrip() + "\n..."
     embed = {
-        "title": f"Secrets Watcher: {scanner} findings in {org}",
+        "title": f"Secrets Watcher: {safe_scanner} findings in {safe_org}",
         "color": 0xF1C40F,
         "timestamp": generated_at.isoformat(),
         "fields": [
-            {"name": "Findings", "value": value or "(summary unavailable)", "inline": False}
+            {"name": "Findings", "value": value, "inline": False}
         ],
     }
     payload = {"embeds": [embed]}
@@ -622,6 +718,24 @@ def send_discord_findings(
     request = urllib.request.Request(
         webhook, data=data, headers={"Content-Type": "application/json"}
     )
+    if backup_dir:
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            safe_org_name = safe_org.replace("/", "_").replace(" ", "-") or "org"
+            file_name = (
+                f"{generated_at.strftime('%Y%m%dT%H%M%SZ')}_{safe_org_name}_{safe_scanner.lower()}.txt"
+            )
+            backup_lines = [
+                f"Scanner: {safe_scanner}",
+                f"Organization: {safe_org}",
+                f"Generated: {generated_at.isoformat()}",
+                "",
+                "Findings:",
+            ]
+            backup_lines.extend(lines if lines else ["(summary unavailable)"])
+            (backup_dir / file_name).write_text("\n".join(backup_lines) + "\n", encoding="utf-8")
+        except Exception as exc:
+            LOG.debug("Failed to write Discord findings backup: %s", exc)
     try:
         urllib.request.urlopen(request, timeout=10)
     except Exception:
@@ -676,7 +790,13 @@ def process_org(
     filtered_trufflehog = filter_false_positives(trufflehog_findings)
     findings.extend(filtered_trufflehog)
     if notify_immediate and webhook_url and filtered_trufflehog:
-        send_discord_findings(webhook_url, org_name, "Trufflehog", filtered_trufflehog)
+        send_discord_findings(
+            webhook_url,
+            org_name,
+            "Trufflehog",
+            filtered_trufflehog,
+            context.notification_backup_dir,
+        )
 
     gitleaks_findings = run_gitleaks(org_name, repos, context)
     if gitleaks_findings:
@@ -686,7 +806,13 @@ def process_org(
     filtered_gitleaks = filter_false_positives(gitleaks_findings)
     findings.extend(filtered_gitleaks)
     if notify_immediate and webhook_url and filtered_gitleaks:
-        send_discord_findings(webhook_url, org_name, "Gitleaks", filtered_gitleaks)
+        send_discord_findings(
+            webhook_url,
+            org_name,
+            "Gitleaks",
+            filtered_gitleaks,
+            context.notification_backup_dir,
+        )
 
     return findings, len(repos)
 
@@ -708,6 +834,14 @@ def build_context(config: dict[str, Any], base_dir: Path) -> RunContext:
     state_path = resolve_path(base_dir, run_cfg.get("state_path", "state.txt"))
     report_path = resolve_path(base_dir, run_cfg.get("report_path", "artifacts/report.md"))
     raw_dir = resolve_path(base_dir, run_cfg.get("raw_output_dir", "artifacts/raw"))
+    backup_dir_setting = notifications_cfg.get("backup_dir")
+    if backup_dir_setting:
+        notification_backup_dir = resolve_path(base_dir, str(backup_dir_setting))
+    else:
+        default_backup = run_cfg.get("discord_backup_dir", "artifacts/discord-backups")
+        notification_backup_dir = (
+            resolve_path(base_dir, default_backup) if default_backup else None
+        )
     return RunContext(
         github_cfg=github_cfg,
         trufflehog_cfg=trufflehog_cfg,
@@ -721,6 +855,7 @@ def build_context(config: dict[str, Any], base_dir: Path) -> RunContext:
         state_path=state_path,
         report_path=report_path,
         raw_dir=raw_dir,
+        notification_backup_dir=notification_backup_dir,
     )
 
 
@@ -796,6 +931,7 @@ def main() -> int:
             statuses_log,
             errors,
             context.report_path,
+            context.notification_backup_dir,
             new_pointer,
         )
     LOG.info("Run complete. Processed %s org(s). Findings: %s. Next index: %s.", processed, len(deduped), new_pointer)
@@ -807,9 +943,6 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except KeyboardInterrupt:
         raise SystemExit(130)
-
-
-
 
 
 
