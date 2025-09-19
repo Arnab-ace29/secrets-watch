@@ -20,6 +20,8 @@ Key settings:
 - `github.token` – personal access token with `repo` + `security_events`
 - `orgs` – every org you want scanned (order matters for resume logic)
 - `scanners.trufflehog` / `scanners.gitleaks` – binary paths and flags
+- `dorks.queries` - optional GitHub code-search keywords used as a prefilter before cloning repos.
+- `run.log_level` - set to `INFO` (default) or `DEBUG` to control console verbosity.
 - `run` – where to save reports, logs, and state
 
 ## Run
@@ -30,6 +32,7 @@ Optional flags:
 - `--max-orgs N` – only process the next N orgs (defaults to the entire list)
 - `--start-index I` – ignore the saved pointer and begin at org index `I`
 - `--force` – ignore resume pointer and always start at the top
+- `--dorks {0,1}` - override the dork prefilter (0 disables, 1 forces enable; default comes from config)
 
 `state.txt` tracks the next org index so interrupted runs resume automatically. `history.txt` keeps a reverse-chronological log of completed org scans.
 
